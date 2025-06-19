@@ -7,6 +7,7 @@
 
 import Foundation
 import MediaPlayer
+import AVFoundation
 
 public typealias AudioPlayerState = AVPlayerWrapperState
 
@@ -65,7 +66,7 @@ public class AudioPlayer: AVPlayerWrapperDelegate {
         
         try action()
         
-        if playWhenReady == true, playbackError == nil {
+        if playWhenReady == true {
             self.playWhenReady = true
         }
     }
@@ -250,6 +251,7 @@ public class AudioPlayer: AVPlayerWrapperDelegate {
     public func stop() {
         let wasActive = wrapper.playbackActive
         wrapper.stop()
+        
         if (wasActive) {
             event.playbackEnd.emit(data: .playerStopped)
         }
@@ -445,5 +447,33 @@ public class AudioPlayer: AVPlayerWrapperDelegate {
     
     func AVWrapperDidRecreateAVPlayer() {
         event.didRecreateAVPlayer.emit(data: ())
+    }
+    
+    // MARK: - Equalizer Public Interface
+    // Added methods for equalizer control through the wrapper
+    
+    /// Enable or disable the equalizer
+    public func setEqualizerEnabled(_ enabled: Bool) {
+        (wrapper as? AVPlayerWrapper)?.setEqualizerEnabled(enabled)
+    }
+    
+    /// Apply a specific equalizer preset
+    public func setEqualizerPreset(_ preset: String) {
+        (wrapper as? AVPlayerWrapper)?.setEqualizerPreset(preset)
+    }
+    
+    /// Get the current equalizer preset
+    public func getEqualizerPreset() -> String? {
+        return (wrapper as? AVPlayerWrapper)?.getEqualizerPreset()
+    }
+    
+    /// Check if equalizer is enabled
+    public func isEqualizerEnabled() -> Bool {
+        return (wrapper as? AVPlayerWrapper)?.isEqualizerEnabled() ?? false
+    }
+    
+    /// Get all available equalizer preset names
+    public func getAvailableEqualizerPresets() -> [String] {
+        return (wrapper as? AVPlayerWrapper)?.getAvailableEqualizerPresets() ?? []
     }
 }
