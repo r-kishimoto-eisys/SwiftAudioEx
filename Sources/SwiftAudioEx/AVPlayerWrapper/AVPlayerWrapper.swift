@@ -56,493 +56,7 @@ public enum EqualizerPreset: String, CaseIterable {
     }
 }
 
-// Equalizer Manager Delegate
-public protocol EqualizerManagerDelegate: AnyObject {
-    func equalizerManager(_ manager: EqualizerManager, didChangePreset preset: EqualizerPreset)
-    func equalizerManager(_ manager: EqualizerManager, didChangeEnabledState enabled: Bool)
-}
 
-// Equalizer Manager Class - AVAudioPCMBuffer Streaming Implementation
-public class EqualizerManager {
-    // Audio engine components
-    private let audioEngine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private let equalizer = AVAudioUnitEQ(numberOfBands: 5)
-    
-    // Current state
-    private var currentPreset: EqualizerPreset = .flat
-    private var isEnabled: Bool = false
-    
-    // Audio format and streaming
-    private var audioFormat: AVAudioFormat?
-    private var isStreamingContent = false
-    private var streamingURL: URL?
-    
-    // Playback state
-    private var isPlayingAudio = false
-    private var currentTime: TimeInterval = 0
-    private var currentVolume: Float = 1.0
-    private var currentRate: Float = 1.0
-    
-    // PCM Buffer streaming components
-    private let bufferQueue = DispatchQueue(label: "pcm.buffer.queue")
-    private let networkQueue = DispatchQueue(label: "network.streaming.queue")
-    private var streamingTask: URLSessionDataTask?
-    private var audioConverter: AVAudioConverter?
-    private var pendingBuffers: [AVAudioPCMBuffer] = []
-    private var isSchedulingBuffers = false
-    private var bufferSize: AVAudioFrameCount = 4096
-    
-    // For local file playback
-    private var audioFile: AVAudioFile?
-    private var fileReadPosition: AVAudioFramePosition = 0
-    
-    // Delegate for state updates
-    public weak var delegate: EqualizerManagerDelegate?
-    
-    public init() {
-        setupAudioEngine()
-        setupEqualizer()
-        setupAudioFormat()
-    }
-    
-    // MARK: - Audio Format Setup
-    private func setupAudioFormat() {
-        // Set up standard PCM format for streaming
-        audioFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)
-        print("🎵 EqualizerManager: Audio format set up: \(audioFormat?.description ?? "nil")")
-    }
-    
-    // MARK: - Audio Engine Setup
-    private func setupAudioEngine() {
-        print("🔧 EqualizerManager: Setting up audio engine...")
-        
-        // Add nodes to the audio engine
-        audioEngine.attach(playerNode)
-        audioEngine.attach(equalizer)
-        print("🔧 EqualizerManager: Attached playerNode and equalizer to engine")
-        
-        // Get the main mixer node
-        let mainMixer = audioEngine.mainMixerNode
-        print("🔧 EqualizerManager: Got main mixer node")
-        
-        // Connect the nodes: playerNode -> equalizer -> mainMixer -> output
-        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)
-        print("🔧 EqualizerManager: Using format: \(format?.description ?? "nil")")
-        
-        audioEngine.connect(playerNode, to: equalizer, format: format)
-        print("🔧 EqualizerManager: Connected playerNode -> equalizer")
-        
-        audioEngine.connect(equalizer, to: mainMixer, format: format)
-        print("🔧 EqualizerManager: Connected equalizer -> mainMixer")
-        
-        // Prepare the engine
-        audioEngine.prepare()
-        print("🔧 EqualizerManager: Audio engine prepared")
-        
-        // Log the audio chain
-        print("🔧 EqualizerManager: Audio chain: playerNode -> equalizer -> mainMixer -> output")
-    }
-    
-    private func setupEqualizer() {
-        // Configure equalizer bands for the specified frequencies
-        let frequencies: [Float] = [500, 1000, 2000, 4000, 8000]
-        
-        for (index, frequency) in frequencies.enumerated() {
-            if index < equalizer.bands.count {
-                let band = equalizer.bands[index]
-                band.filterType = .parametric
-                band.frequency = frequency
-                band.bandwidth = 1.0  // Q factor
-                band.gain = 0.0      // Initial gain (flat)
-                band.bypass = false
-            }
-        }
-    }
-    
-    // MARK: - Public Interface
-    
-    // Enable/disable equalizer
-    public func setEnabled(_ enabled: Bool) {
-        print("🎛️ EqualizerManager: setEnabled called with: \(enabled)")
-        isEnabled = enabled
-        
-        if enabled {
-            print("🎛️ EqualizerManager: Starting audio engine...")
-            startAudioEngine()
-        } else {
-            print("🎛️ EqualizerManager: Disabling - setting all bands to flat")
-            // When disabling, set all bands to flat
-            for (index, band) in equalizer.bands.enumerated() {
-                print("🎛️ EqualizerManager: Setting band \(index) to 0.0dB")
-                band.gain = 0.0
-            }
-        }
-        
-        delegate?.equalizerManager(self, didChangeEnabledState: enabled)
-    }
-    
-    // Apply equalizer preset
-    public func applyPreset(_ preset: EqualizerPreset) {
-        print("🎵 EqualizerManager: Applying preset \(preset.rawValue)")
-        currentPreset = preset
-        let gains = preset.gains
-        let frequencies: [Float] = [500, 1000, 2000, 4000, 8000]
-        
-        print("🎵 EqualizerManager: Preset gains: \(gains)")
-        
-        for (index, frequency) in frequencies.enumerated() {
-            if index < equalizer.bands.count {
-                let band = equalizer.bands[index]
-                let newGain = gains[frequency] ?? 0.0
-                print("🎵 EqualizerManager: Setting band \(index) (freq: \(frequency)Hz) gain: \(newGain)dB")
-                band.gain = newGain
-                print("🎵 EqualizerManager: Band \(index) actual gain after setting: \(band.gain)dB")
-            }
-        }
-        
-        print("🎵 EqualizerManager: Preset \(preset.rawValue) applied successfully")
-        delegate?.equalizerManager(self, didChangePreset: preset)
-    }
-    
-    // Get current preset
-    public func getCurrentPreset() -> EqualizerPreset {
-        return currentPreset
-    }
-    
-    // Get enabled state
-    public func isEqualizerEnabled() -> Bool {
-        return isEnabled
-    }
-    
-    // MARK: - Audio Playback Control
-    
-    // Load audio from URL - handles both local files and streaming with PCM buffers
-    public func loadAudio(from url: URL) {
-        print("📂 EqualizerManager: Loading audio from: \(url)")
-        print("📂 EqualizerManager: URL scheme: \(url.scheme ?? "nil")")
-        
-        // Stop any current playback
-        stop()
-        
-        if url.isFileURL {
-            // Local file handling
-            loadLocalFileWithPCMBuffers(url: url)
-        } else {
-            // Streaming URL handling with PCM buffers
-            loadStreamingURLWithPCMBuffers(url: url)
-        }
-        
-        // Start audio engine if not running
-        startAudioEngine()
-    }
-    
-    // MARK: - Local File Loading with PCM Buffers
-    private func loadLocalFileWithPCMBuffers(url: URL) {
-        print("📂 EqualizerManager: Loading local file with PCM buffers...")
-        isStreamingContent = false
-        
-        do {
-            audioFile = try AVAudioFile(forReading: url)
-            audioFormat = audioFile?.processingFormat
-            fileReadPosition = 0
-            
-            print("✅ EqualizerManager: Successfully loaded local audio file")
-            print("📂 EqualizerManager: Audio format: \(audioFormat?.description ?? "nil")")
-            print("📂 EqualizerManager: File length: \(audioFile?.length ?? 0) frames")
-            
-            // Reconnect nodes with the file's format
-            if let format = audioFormat {
-                reconnectNodesWithFormat(format)
-            }
-        } catch {
-            print("❌ EqualizerManager: Failed to load local audio file: \(error)")
-            audioFile = nil
-        }
-    }
-    
-    // MARK: - Streaming with PCM Buffers
-    private func loadStreamingURLWithPCMBuffers(url: URL) {
-        print("🌐 EqualizerManager: Setting up streaming with PCM buffers...")
-        isStreamingContent = true
-        streamingURL = url
-        audioFile = nil
-        
-        // Use standard format for streaming
-        guard let format = audioFormat else {
-            print("❌ EqualizerManager: No audio format available")
-            return
-        }
-        
-        reconnectNodesWithFormat(format)
-        startStreamingWithPCMBuffers(url: url)
-    }
-    
-    private func startStreamingWithPCMBuffers(url: URL) {
-        print("🌐 EqualizerManager: Starting streaming download for: \(url)")
-        
-        // Cancel any existing streaming task
-        streamingTask?.cancel()
-        
-        // Create streaming task
-        streamingTask = URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
-            guard let self = self else { return }
-            
-            if let error = error {
-                print("❌ EqualizerManager: Streaming error: \(error)")
-                return
-            }
-            
-            guard let data = data else {
-                print("❌ EqualizerManager: No data received from stream")
-                return
-            }
-            
-            print("🌐 EqualizerManager: Received \(data.count) bytes from stream")
-            self.processStreamingDataToPCMBuffers(data)
-        }
-        
-        streamingTask?.resume()
-        print("🌐 EqualizerManager: Streaming download started")
-    }
-    
-    private func processStreamingDataToPCMBuffers(_ data: Data) {
-        networkQueue.async { [weak self] in
-            guard let self = self, let audioFormat = self.audioFormat else { return }
-            
-            print("🎵 EqualizerManager: Processing streaming data to PCM buffers...")
-            
-            // Create temporary file from streaming data
-            let tempURL = self.createTemporaryFile(from: data)
-            
-            do {
-                // Read the temporary file and convert to PCM buffers
-                let tempFile = try AVAudioFile(forReading: tempURL)
-                let frameCount = AVAudioFrameCount(tempFile.length)
-                
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount) else {
-                    print("❌ EqualizerManager: Failed to create PCM buffer")
-                    return
-                }
-                
-                try tempFile.read(into: buffer)
-                buffer.frameLength = frameCount
-                
-                print("✅ EqualizerManager: Created PCM buffer with \(frameCount) frames")
-                
-                DispatchQueue.main.async {
-                    self.addPCMBufferToQueue(buffer)
-                }
-                
-                // Clean up temporary file
-                try? FileManager.default.removeItem(at: tempURL)
-                
-            } catch {
-                print("❌ EqualizerManager: Failed to process streaming data to PCM: \(error)")
-            }
-        }
-    }
-    
-    private func addPCMBufferToQueue(_ buffer: AVAudioPCMBuffer) {
-        bufferQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            self.pendingBuffers.append(buffer)
-            print("🎵 EqualizerManager: Added buffer to queue. Queue size: \(self.pendingBuffers.count)")
-            
-            if !self.isSchedulingBuffers {
-                self.scheduleNextBuffer()
-            }
-        }
-    }
-    
-    private func scheduleNextBuffer() {
-        bufferQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            guard !self.pendingBuffers.isEmpty else {
-                self.isSchedulingBuffers = false
-                print("🎵 EqualizerManager: No more buffers to schedule")
-                return
-            }
-            
-            let buffer = self.pendingBuffers.removeFirst()
-            self.isSchedulingBuffers = true
-            
-            DispatchQueue.main.async {
-                self.playerNode.scheduleBuffer(buffer) { [weak self] in
-                    self?.scheduleNextBuffer()
-                }
-                print("🎵 EqualizerManager: Scheduled buffer with \(buffer.frameLength) frames")
-            }
-        }
-    }
-    
-    private func createTemporaryFile(from data: Data) -> URL {
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempURL = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
-        
-        do {
-            try data.write(to: tempURL)
-            print("💾 EqualizerManager: Created temporary file: \(tempURL)")
-        } catch {
-            print("❌ EqualizerManager: Failed to create temporary file: \(error)")
-        }
-        
-        return tempURL
-    }
-    
-    // Play audio - supports both local files and streaming
-    public func play() {
-        print("🎬 EqualizerManager: Starting playback...")
-        
-        guard !isPlayingAudio else {
-            print("🎬 EqualizerManager: Already playing")
-            return
-        }
-        
-        // Start audio engine if not running
-        startAudioEngine()
-        
-        if isStreamingContent {
-            // For streaming content, start playing the queued buffers
-            print("🌐 EqualizerManager: Starting streaming playback")
-            playerNode.play()
-            isPlayingAudio = true
-            
-            // Start scheduling buffers if we have any
-            if !pendingBuffers.isEmpty && !isSchedulingBuffers {
-                scheduleNextBuffer()
-            }
-        } else {
-            // For local files, use PCM buffer approach for consistency
-            playLocalFileWithPCMBuffers()
-        }
-    }
-    
-    private func playLocalFileWithPCMBuffers() {
-        guard let audioFile = audioFile else {
-            print("❌ EqualizerManager: No audio file loaded")
-            return
-        }
-        
-        print("📂 EqualizerManager: Starting local file playback with PCM buffers")
-        
-        // Read file in chunks and schedule as buffers
-        readAndScheduleFileBuffers()
-        playerNode.play()
-        isPlayingAudio = true
-    }
-    
-    private func readAndScheduleFileBuffers() {
-        guard let audioFile = audioFile, let audioFormat = audioFormat else { return }
-        
-        let framesToRead = min(bufferSize, AVAudioFrameCount(audioFile.length - fileReadPosition))
-        guard framesToRead > 0 else {
-            print("📂 EqualizerManager: Reached end of file")
-            return
-        }
-        
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: framesToRead) else {
-            print("❌ EqualizerManager: Failed to create buffer for local file")
-            return
-        }
-        
-        do {
-            audioFile.framePosition = fileReadPosition
-            try audioFile.read(into: buffer, frameCount: framesToRead)
-            buffer.frameLength = framesToRead
-            
-            playerNode.scheduleBuffer(buffer) { [weak self] in
-                DispatchQueue.main.async {
-                    self?.continueReadingLocalFile()
-                }
-            }
-            
-            fileReadPosition += AVAudioFramePosition(framesToRead)
-            print("📂 EqualizerManager: Scheduled local file buffer: \(framesToRead) frames")
-            
-        } catch {
-            print("❌ EqualizerManager: Failed to read local file: \(error)")
-        }
-    }
-    
-    private func continueReadingLocalFile() {
-        guard isPlayingAudio, let audioFile = audioFile else { return }
-        
-        if fileReadPosition < audioFile.length {
-            readAndScheduleFileBuffers()
-        } else {
-            print("📂 EqualizerManager: Local file playback completed")
-            isPlayingAudio = false
-        }
-    }
-    
-    // Pause audio
-    public func pause() {
-        if isPlayingAudio {
-            playerNode.pause()
-            isPlayingAudio = false
-            print("EqualizerManager: Paused playback")
-        }
-    }
-    
-    // Stop audio
-    public func stop() {
-        if isPlayingAudio {
-            playerNode.stop()
-            isPlayingAudio = false
-            print("EqualizerManager: Stopped playback")
-        }
-    }
-    
-    // MARK: - Audio Engine Control
-    
-    private func startAudioEngine() {
-        guard !audioEngine.isRunning else { 
-            print("🔊 EqualizerManager: Audio engine already running")
-            return 
-        }
-        
-        do {
-            try audioEngine.start()
-            print("✅ EqualizerManager: Audio engine started successfully")
-        } catch {
-            print("❌ EqualizerManager: Failed to start audio engine: \(error)")
-        }
-    }
-    
-    private func stopAudioEngine() {
-        if audioEngine.isRunning {
-            audioEngine.stop()
-        }
-    }
-    
-    // MARK: - Volume and Rate Control
-    
-    public func setVolume(_ volume: Float) {
-        currentVolume = volume
-        audioEngine.mainMixerNode.outputVolume = volume
-    }
-    
-    public func setRate(_ rate: Float) {
-        currentRate = rate
-        // Note: Rate control would require more complex implementation
-        // For now, we'll store the rate for future use
-        print("EqualizerManager: Rate set to \(rate)")
-    }
-    
-    public func isPlaying() -> Bool {
-        return isPlayingAudio
-    }
-    
-    // MARK: - Cleanup
-    
-    public func cleanup() {
-        stopAudioEngine()
-        audioFile = nil
-    }
-}
 
 public enum PlaybackEndedReason: String {
     case playedUntilEnd
@@ -555,12 +69,25 @@ public enum PlaybackEndedReason: String {
 }
 
 class AVPlayerWrapper: AVPlayerWrapperProtocol {
-    // MARK: - Properties - Pure AVAudioEngine + PCM Buffer Implementation
+    // MARK: - Properties - AVPlayer + AVAudioEngine Implementation
     
-    // AVAudioEngine for all audio processing and playback
-    private let equalizerManager = EqualizerManager()
+    // AVPlayer for streaming and seek (silent)
+    private var mainAVPlayer: AVPlayer?
+    private var currentPlayerItem: AVPlayerItem?
+    
+    // AVAudioEngine for equalizer processing
+    private let audioEngine = AVAudioEngine()
+    private let playerNode = AVAudioPlayerNode()
+    private let equalizerUnit = AVAudioUnitEQ(numberOfBands: 5)
     private var currentEqualizerPreset: String = "flat"
     private var equalizerEnabled: Bool = false
+    
+    // Audio file for AVAudioEngine playback
+    private var audioFile: AVAudioFile?
+    private var isEnginePlaybackActive = false
+    
+    // Temporary file tracking
+    private var temporaryFiles: Set<URL> = []
     
     // State management
     private var url: URL? = nil
@@ -588,7 +115,8 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     private let avPlayer = AVPlayer()
 
     public init() {
-        print("🚀 AVPlayerWrapper: Initializing pure AVAudioEngine + PCM Buffer implementation")
+        print("🚀 AVPlayerWrapper: Initializing AVPlayer + AVAudioEngine implementation")
+        setupAVPlayer()
         setupAudioEngine()
     }
     
@@ -642,17 +170,32 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     }
     
     var currentTime: TimeInterval {
-        // Calculate current time based on playback start time
-        if equalizerManager.isPlaying(), let startTime = playbackStartTime {
+        // Get current time from AVPlayer
+        guard let player = mainAVPlayer else { return pausedTime }
+        
+        let currentCMTime = player.currentTime()
+        if currentCMTime.isValid && !currentCMTime.isIndefinite {
+            return CMTimeGetSeconds(currentCMTime)
+        }
+        
+        // Fallback to calculated time
+        if player.rate > 0, let startTime = playbackStartTime {
             return pausedTime + Date().timeIntervalSince(startTime)
         }
         return pausedTime
     }
     
     var duration: TimeInterval {
-        // For now return a reasonable default duration
-        // This could be enhanced to get actual duration from loaded audio
-        return 300.0 // 5 minutes default
+        // Get duration from AVPlayerItem
+        guard let playerItem = currentPlayerItem else { return 0 }
+        
+        let durationCMTime = playerItem.duration
+        if durationCMTime.isValid && !durationCMTime.isIndefinite {
+            return CMTimeGetSeconds(durationCMTime)
+        }
+        
+        // Return 0 for live streams or unknown duration
+        return 0
     }
     
     var bufferedPosition: TimeInterval {
@@ -666,8 +209,8 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         set {
             _rate = newValue
             audioEngineRate = newValue
-            // Apply rate to AVAudioEngine
-            equalizerManager.setRate(newValue)
+            // Apply rate to AVPlayer
+            mainAVPlayer?.rate = newValue
         }
     }
 
@@ -684,11 +227,12 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     var volume: Float {
         get { audioEngineVolume }
         set { 
-            print("🔊 AVPlayerWrapper: Setting volume to \(newValue) on AVAudioEngine")
+            print("🔊 AVPlayerWrapper: Setting volume to \(newValue) on AudioEngine")
             audioEngineVolume = newValue
-            // Apply volume to AVAudioEngine only (AVPlayer is muted)
-            equalizerManager.setVolume(newValue)
+            // Apply volume to AudioEngine
+            audioEngine.mainMixerNode.outputVolume = newValue
             // Keep AVPlayer muted
+            mainAVPlayer?.volume = 0.0
             avPlayer.volume = 0.0
         }
     }
@@ -697,19 +241,19 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         get { audioEngineVolume == 0.0 }
         set { 
             if newValue {
-                equalizerManager.setVolume(0.0)
+                audioEngine.mainMixerNode.outputVolume = 0.0
             } else {
-                equalizerManager.setVolume(audioEngineVolume)
+                audioEngine.mainMixerNode.outputVolume = audioEngineVolume
             }
         }
     }
 
     var automaticallyWaitsToMinimizeStalling: Bool {
         get { true }
-        set { /* Not applicable for AVAudioEngine */ }
+        set { /* Not applicable for this implementation */ }
     }
     
-    // Required protocol properties - Pure AVAudioEngine implementation
+    // Required protocol properties
     var currentItem: AVPlayerItem? {
         get { _currentItem }
     }
@@ -718,23 +262,67 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         get { nil }
     }
     
+    // Add playbackState computed property for compatibility
+    var playbackState: AVPlayerWrapperState {
+        get {
+            // If AVPlayer is actively playing, ensure we return playing state
+            if let player = mainAVPlayer, player.rate > 0 && state != .playing {
+                return .playing
+            }
+            return state
+        }
+    }
+    
     func play() {
-        print("🎬 AVPlayerWrapper: play() called - using pure AVAudioEngine")
+        print("🎬 AVPlayerWrapper: play() called - using AVAudioEngine")
         playWhenReady = true
         
-        if equalizerManager.isPlaying() {
+        // Check if we're still loading
+        if state == .loading {
+            print("⏳ AVPlayerWrapper: Still loading audio file, will play when ready")
+            return
+        }
+        
+        guard let audioFile = audioFile else {
+            print("❌ AVPlayerWrapper: No audio file available for AudioEngine")
+            // If we don't have an audio file but should play when ready, 
+            // this will be handled in the load completion callback
+            return
+        }
+        
+        if isEnginePlaybackActive {
             print("🎬 AVPlayerWrapper: Already playing")
             return
         }
         
+        // Start AVPlayer for seek tracking (muted)
+        mainAVPlayer?.play()
+        
+        // Start AudioEngine playback with equalizer
+        playWithAudioEngine(audioFile: audioFile)
+        
         playbackStartTime = Date()
-        equalizerManager.play()
         state = .playing
         startProgressTracking()
+        print("✅ AVPlayerWrapper: Started playback with AudioEngine + Equalizer")
+    }
+    
+    private func playWithAudioEngine(audioFile: AVAudioFile) {
+        // Schedule the entire file for playback
+        playerNode.scheduleFile(audioFile, at: nil) { [weak self] in
+            DispatchQueue.main.async {
+                self?.isEnginePlaybackActive = false
+                print("🎵 AVPlayerWrapper: AudioEngine playback completed")
+            }
+        }
+        
+        playerNode.play()
+        isEnginePlaybackActive = true
+        print("🎵 AVPlayerWrapper: AudioEngine playback started")
     }
     
     func pause() {
-        print("⏸️ AVPlayerWrapper: pause() called - using pure AVAudioEngine")
+        print("⏸️ AVPlayerWrapper: pause() called - using AudioEngine")
         playWhenReady = false
         
         // Update paused time
@@ -743,13 +331,20 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         }
         playbackStartTime = nil
         
-        equalizerManager.pause()
+        // Pause AudioEngine
+        playerNode.pause()
+        isEnginePlaybackActive = false
+        
+        // Pause AVPlayer (for seek tracking)
+        mainAVPlayer?.pause()
+        
         state = .paused
         stopProgressTracking()
+        print("✅ AVPlayerWrapper: Paused playback with AudioEngine")
     }
     
     func togglePlaying() {
-        if equalizerManager.isPlaying() {
+        if isEnginePlaybackActive {
             pause()
         } else {
             play()
@@ -757,24 +352,121 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     }
     
     func stop() {
-        print("⏹️ AVPlayerWrapper: stop() called - using pure AVAudioEngine")
+        print("⏹️ AVPlayerWrapper: stop() called - using AudioEngine")
+        
         state = .stopped
         playWhenReady = false
         pausedTime = 0
         playbackStartTime = nil
-        equalizerManager.stop()
+        
+        // Stop AudioEngine playback
+        if isEnginePlaybackActive {
+            playerNode.stop()
+            isEnginePlaybackActive = false
+        }
+        
+        // Stop and reset AVPlayer
+        mainAVPlayer?.pause()
+        mainAVPlayer?.seek(to: CMTime.zero)
+        
         stopProgressTracking()
+        print("✅ AVPlayerWrapper: Stopped playback with AudioEngine")
     }
     
     func seek(to seconds: TimeInterval) {
         print("⏩ AVPlayerWrapper: seek(to:) called with \(seconds) seconds")
-        // For AVAudioEngine implementation, seeking is more complex
-        // For now, store the seek time and implement basic seeking
-        timeToSeekToAfterLoading = seconds
-        pausedTime = seconds
         
-        // Notify delegate that seek completed
-        delegate?.AVWrapper(seekTo: seconds, didFinish: true)
+        guard let player = mainAVPlayer, let audioFile = audioFile else {
+            print("❌ AVPlayerWrapper: No AVPlayer or audio file available")
+            return
+        }
+        
+        // Check if player is ready for seeking
+        guard let playerItem = currentPlayerItem, playerItem.status == .readyToPlay else {
+            print("❌ AVPlayerWrapper: Player item not ready for seeking")
+            // Store seek time for later when player is ready
+            timeToSeekToAfterLoading = seconds
+            return
+        }
+        
+        let time = CMTime(seconds: seconds, preferredTimescale: 1000)
+        let wasPlaying = isEnginePlaybackActive
+        
+        // Stop AudioEngine playback before seeking
+        if isEnginePlaybackActive {
+            playerNode.stop()
+            isEnginePlaybackActive = false
+        }
+        
+        print("🔄 AVPlayerWrapper: Seeking AVPlayer to \(seconds)s, was playing: \(wasPlaying)")
+        
+        // Seek AVPlayer for time tracking
+        player.seek(to: time, toleranceBefore: CMTime.zero, toleranceAfter: CMTime.zero) { [weak self] completed in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                
+                if completed {
+                    print("✅ AVPlayerWrapper: AVPlayer seek completed to \(seconds) seconds")
+                    self.pausedTime = seconds
+                    
+                    // Clear any pending seek time
+                    self.timeToSeekToAfterLoading = nil
+                    
+                    // Restart AudioEngine playback from new position if was playing
+                    if wasPlaying {
+                        self.seekAndResumeAudioEngine(to: seconds, audioFile: audioFile)
+                    }
+                } else {
+                    print("❌ AVPlayerWrapper: AVPlayer seek failed")
+                }
+                self.delegate?.AVWrapper(seekTo: seconds, didFinish: completed)
+            }
+        }
+    }
+    
+    private func seekAndResumeAudioEngine(to seconds: TimeInterval, audioFile: AVAudioFile) {
+        print("🎵 AVPlayerWrapper: Seeking and resuming AudioEngine to \(seconds)s")
+        
+        // Ensure player node is stopped
+        if playerNode.isPlaying {
+            playerNode.stop()
+        }
+        
+        // Calculate frame position for seek
+        let sampleRate = audioFile.fileFormat.sampleRate
+        let framePosition = AVAudioFramePosition(seconds * sampleRate)
+        let maxFrame = audioFile.length
+        let clampedPosition = max(0, min(framePosition, maxFrame))
+        
+        print("🎵 AVPlayerWrapper: Seeking to frame \(clampedPosition) of \(maxFrame)")
+        
+        // Schedule playback from new position
+        let frameCount = AVAudioFrameCount(maxFrame - clampedPosition)
+        if frameCount > 0 {
+            // Schedule the segment
+            playerNode.scheduleSegment(audioFile, startingFrame: clampedPosition, frameCount: frameCount, at: nil) { [weak self] in
+                DispatchQueue.main.async {
+                    print("🎵 AVPlayerWrapper: AudioEngine seek segment completed")
+                    // Don't set isEnginePlaybackActive to false here if we want continuous playback
+                }
+            }
+            
+            // Start playback
+            playerNode.play()
+            isEnginePlaybackActive = true
+            playbackStartTime = Date()
+            state = .playing
+            startProgressTracking()
+            
+            print("✅ AVPlayerWrapper: AudioEngine resumed from position \(seconds)s")
+        } else {
+            print("❌ AVPlayerWrapper: No frames to play from position \(seconds)s")
+        }
+    }
+    
+    private func restartAudioEngineFromPosition(_ seconds: TimeInterval, audioFile: AVAudioFile) {
+        // This method is kept for backwards compatibility but uses the new implementation
+        seekAndResumeAudioEngine(to: seconds, audioFile: audioFile)
     }
 
     func seek(by seconds: TimeInterval) {
@@ -790,10 +482,10 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     }
     
     func load() {
-        print("📂 AVPlayerWrapper: load() called - simplified for AVAudioEngine")
-        // For AVAudioEngine implementation, this is handled by loadAudio
-        // Just set state to ready
-        state = .ready
+        print("📂 AVPlayerWrapper: load() called - AudioEngine needs URL, doing nothing")
+        // For AVAudioEngine implementation, this method doesn't make sense without a URL
+        // The proper load method is load(from:playWhenReady:options:)
+        // Don't change state here as we don't have any content to load
     }
     
     func load(from url: URL, playWhenReady: Bool, options: [String: Any]? = nil) {
@@ -802,24 +494,56 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         self.url = url
         self.urlOptions = options
         
+        // Stop current playback and clean up
+        stop()
+        audioFile = nil
+        cleanupTemporaryFiles()
+        
+        // Reset AudioEngine to prepare for new audio format
+        resetAudioEngineForNewTrack()
+        
         // Reset state
         pausedTime = 0
         playbackStartTime = nil
-        
-        // Load directly into AVAudioEngine with PCM buffers
         state = .loading
-        equalizerManager.loadAudio(from: url)
         
-        // Set state to ready - the equalizer manager handles the actual loading
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self = self else { return }
-            self.state = .ready
-            
-            if self.playWhenReady {
-                self.play()
+        // Create AVPlayerItem for seek functionality only
+        let playerItem = AVPlayerItem(url: url)
+        currentPlayerItem = playerItem
+        
+        // Set up player item for the main AVPlayer (muted)
+        mainAVPlayer?.replaceCurrentItem(with: playerItem)
+        
+        // Download audio file for AudioEngine playback
+        downloadAudioFile(from: url) { [weak self] success in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if success {
+                    print("✅ AVPlayerWrapper: Audio file loaded successfully")
+                    if self.state == .loading {
+                        self.state = .ready
+                        
+                        // Handle any pending seek operation
+                        if let pendingSeekTime = self.timeToSeekToAfterLoading {
+                            print("🔄 AVPlayerWrapper: Executing pending seek to \(pendingSeekTime)s")
+                            self.seek(to: pendingSeekTime)
+                        } else if self.playWhenReady {
+                            print("🎵 AVPlayerWrapper: Audio file ready, starting playback as requested")
+                            self.play()
+                        } else {
+                            print("🎵 AVPlayerWrapper: Audio file ready, waiting for play command")
+                        }
+                    }
+                } else {
+                    print("❌ AVPlayerWrapper: Failed to load audio file")
+                    self.state = .failed
+                }
             }
         }
+        
+        print("✅ AVPlayerWrapper: AVPlayerItem created and configured")
     }
+    
     
     func load(
         from url: URL,
@@ -856,9 +580,17 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     func unload() {
         print("📂 AVPlayerWrapper: unload() called")
         state = .idle
-        equalizerManager.stop()
+        
+        // Clean up AVPlayer
+        mainAVPlayer?.pause()
+        mainAVPlayer?.replaceCurrentItem(with: nil)
+        
+        currentPlayerItem = nil
+        
         pausedTime = 0
         playbackStartTime = nil
+        
+        print("✅ AVPlayerWrapper: Unloaded successfully")
     }
 
     func reload(startFromCurrentTime: Bool) {
@@ -873,14 +605,200 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         }
     }
     
-    // MARK: - Audio Engine Setup
+    // MARK: - AVPlayer + AudioEngine Setup
+    
+    private func setupAVPlayer() {
+        print("🚀 AVPlayerWrapper: Setting up AVPlayer")
+        mainAVPlayer = AVPlayer()
+        mainAVPlayer?.volume = 0.0  // Mute AVPlayer, audio goes through AudioEngine
+        print("✅ AVPlayerWrapper: AVPlayer initialized (muted)")
+    }
     
     private func setupAudioEngine() {
-        print("🚀 AVPlayerWrapper: setupAudioEngine called")
-        // Initialize AVAudioEngine equalizer (always active)
-        equalizerManager.setEnabled(true)  // Always enable for processing
-        print("✅ AVPlayerWrapper: AVAudioEngine initialized and ready")
+        print("🚀 AVPlayerWrapper: Setting up AudioEngine with equalizer")
+        
+        // Configure equalizer bands
+        setupEqualizerBands()
+        
+        // Attach nodes to audio engine
+        audioEngine.attach(playerNode)
+        audioEngine.attach(equalizerUnit)
+        
+        // Connect audio chain: playerNode -> equalizer -> output
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+        audioEngine.connect(playerNode, to: equalizerUnit, format: format)
+        audioEngine.connect(equalizerUnit, to: audioEngine.mainMixerNode, format: format)
+        
+        // Prepare and start audio engine
+        audioEngine.prepare()
+        
+        do {
+            try audioEngine.start()
+            print("✅ AVPlayerWrapper: AudioEngine started successfully")
+        } catch {
+            print("❌ AVPlayerWrapper: Failed to start AudioEngine: \(error)")
+        }
+        
+        print("✅ AVPlayerWrapper: AudioEngine configured with equalizer")
     }
+    
+    private func setupEqualizerBands() {
+        let frequencies: [Float] = [500, 1000, 2000, 4000, 8000]
+        
+        for (index, frequency) in frequencies.enumerated() {
+            if index < equalizerUnit.bands.count {
+                let band = equalizerUnit.bands[index]
+                band.filterType = .parametric
+                band.frequency = frequency
+                band.bandwidth = 1.0
+                band.gain = 0.0 // Start with flat response
+                band.bypass = false
+                print("🎛️ AVPlayerWrapper: Configured band \(index): \(frequency)Hz")
+            }
+        }
+    }
+    
+    private func resetAudioEngineForNewTrack() {
+        print("🔄 AVPlayerWrapper: Resetting AudioEngine for new track")
+        
+        // Stop the player node if it's playing
+        if playerNode.isPlaying {
+            playerNode.stop()
+        }
+        
+        // Stop audio engine
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        
+        // Disconnect all connections
+        audioEngine.disconnectNodeInput(equalizerUnit)
+        audioEngine.disconnectNodeInput(audioEngine.mainMixerNode)
+        
+        print("✅ AVPlayerWrapper: AudioEngine reset completed")
+    }
+    
+    private func setupAudioEngineWithFormat(_ format: AVAudioFormat) {
+        print("🎵 AVPlayerWrapper: Setting up AudioEngine with format: \(format)")
+        
+        // Make sure nodes are attached
+        if !audioEngine.attachedNodes.contains(playerNode) {
+            audioEngine.attach(playerNode)
+        }
+        if !audioEngine.attachedNodes.contains(equalizerUnit) {
+            audioEngine.attach(equalizerUnit)
+        }
+        
+        // Connect with the actual audio format
+        audioEngine.connect(playerNode, to: equalizerUnit, format: format)
+        audioEngine.connect(equalizerUnit, to: audioEngine.mainMixerNode, format: format)
+        
+        // Re-apply current equalizer settings
+        if let currentPreset = EqualizerPreset(rawValue: currentEqualizerPreset) {
+            applyEqualizerPreset(currentPreset)
+        }
+        
+        // Prepare and start audio engine
+        audioEngine.prepare()
+        
+        do {
+            try audioEngine.start()
+            print("✅ AVPlayerWrapper: AudioEngine restarted with new format")
+        } catch {
+            print("❌ AVPlayerWrapper: Failed to start AudioEngine with new format: \(error)")
+        }
+    }
+    
+    private func downloadAudioFile(from url: URL, completion: @escaping (Bool) -> Void) {
+        print("📥 AVPlayerWrapper: Downloading audio file for AudioEngine")
+        
+        if url.isFileURL {
+            // Local file
+            loadLocalAudioFile(url: url, completion: completion)
+        } else {
+            // Remote file - download it
+            downloadRemoteAudioFile(url: url, completion: completion)
+        }
+    }
+    
+    private func loadLocalAudioFile(url: URL, completion: @escaping (Bool) -> Void) {
+        do {
+            audioFile = try AVAudioFile(forReading: url)
+            print("✅ AVPlayerWrapper: Local audio file loaded for AudioEngine")
+            
+            // Setup AudioEngine with the actual file format
+            if let fileFormat = audioFile?.processingFormat {
+                setupAudioEngineWithFormat(fileFormat)
+                print("🎵 AVPlayerWrapper: AudioEngine configured with file format: \(fileFormat)")
+            }
+            
+            completion(true)
+        } catch {
+            print("❌ AVPlayerWrapper: Failed to load local audio file: \(error)")
+            completion(false)
+        }
+    }
+    
+    private func downloadRemoteAudioFile(url: URL, completion: @escaping (Bool) -> Void) {
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            guard let self = self, let data = data, error == nil else {
+                print("❌ AVPlayerWrapper: Failed to download audio file: \(error?.localizedDescription ?? "Unknown error")")
+                completion(false)
+                return
+            }
+            
+            // Create temporary file
+            let tempURL = self.createTemporaryAudioFile(from: data)
+            
+            do {
+                self.audioFile = try AVAudioFile(forReading: tempURL)
+                print("✅ AVPlayerWrapper: Remote audio file downloaded and loaded for AudioEngine")
+                
+                // Setup AudioEngine with the actual file format
+                if let fileFormat = self.audioFile?.processingFormat {
+                    DispatchQueue.main.async {
+                        self.setupAudioEngineWithFormat(fileFormat)
+                        print("🎵 AVPlayerWrapper: AudioEngine configured with downloaded file format: \(fileFormat)")
+                    }
+                }
+                
+                completion(true)
+            } catch {
+                print("❌ AVPlayerWrapper: Failed to create audio file from downloaded data: \(error)")
+                completion(false)
+            }
+        }.resume()
+    }
+    
+    private func createTemporaryAudioFile(from data: Data) -> URL {
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempURL = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
+        
+        do {
+            try data.write(to: tempURL)
+            temporaryFiles.insert(tempURL)
+            print("💾 AVPlayerWrapper: Created temporary audio file: \(tempURL)")
+        } catch {
+            print("❌ AVPlayerWrapper: Failed to create temporary audio file: \(error)")
+        }
+        
+        return tempURL
+    }
+    
+    private func cleanupTemporaryFiles() {
+        for tempURL in temporaryFiles {
+            do {
+                if FileManager.default.fileExists(atPath: tempURL.path) {
+                    try FileManager.default.removeItem(at: tempURL)
+                    print("🧹 AVPlayerWrapper: Deleted temporary file: \(tempURL.lastPathComponent)")
+                }
+            } catch {
+                print("❌ AVPlayerWrapper: Failed to delete temporary file: \(error)")
+            }
+        }
+        temporaryFiles.removeAll()
+    }
+    
     
     private func setupProgressTracking() {
         print("⏱️ AVPlayerWrapper: Setting up progress tracking")
@@ -912,15 +830,15 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
             // Apply current preset when enabling
             if let preset = EqualizerPreset(rawValue: currentEqualizerPreset) {
                 print("🔧 AVPlayerWrapper: Enabling with preset: \(preset.rawValue)")
-                equalizerManager.applyPreset(preset)
+                applyEqualizerPreset(preset)
             } else {
                 print("🔧 AVPlayerWrapper: Enabling with default flat preset")
-                equalizerManager.applyPreset(.flat)
+                applyEqualizerPreset(.flat)
             }
         } else {
             // Apply flat preset when disabling
             print("🔧 AVPlayerWrapper: Disabling equalizer - applying flat preset")
-            equalizerManager.applyPreset(.flat)
+            applyEqualizerPreset(.flat)
         }
         
         print("🔧 AVPlayerWrapper: Equalizer enabled: \(enabled)")
@@ -931,16 +849,32 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         print("🎯 AVPlayerWrapper: setEqualizerPreset called with: \(preset)")
         currentEqualizerPreset = preset
         
-        // Apply preset through equalizer manager
+        // Apply preset through equalizer unit
         if let eqPreset = EqualizerPreset(rawValue: preset) {
             print("🎯 AVPlayerWrapper: Found matching preset enum: \(eqPreset.rawValue)")
-            equalizerManager.applyPreset(eqPreset)
+            applyEqualizerPreset(eqPreset)
         } else {
             print("❌ AVPlayerWrapper: Could not find preset enum for: \(preset)")
         }
         
-        // Log preset change
-        print("🎯 AVPlayerWrapper: Setting equalizer preset to: \(preset)")
+        print("🎯 AVPlayerWrapper: Equalizer preset set to: \(preset)")
+    }
+    
+    private func applyEqualizerPreset(_ preset: EqualizerPreset) {
+        print("🎵 AVPlayerWrapper: Applying preset \(preset.rawValue)")
+        let gains = preset.gains
+        let frequencies: [Float] = [500, 1000, 2000, 4000, 8000]
+        
+        for (index, frequency) in frequencies.enumerated() {
+            if index < equalizerUnit.bands.count {
+                let band = equalizerUnit.bands[index]
+                let newGain = gains[frequency] ?? 0.0
+                print("🎵 AVPlayerWrapper: Setting band \(index) (freq: \(frequency)Hz) gain: \(newGain)dB")
+                band.gain = newGain
+            }
+        }
+        
+        print("✅ AVPlayerWrapper: Preset \(preset.rawValue) applied to AVAudioUnitEQ")
     }
     
     /// Get the current equalizer preset
@@ -958,22 +892,4 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         return ["flat", "voice1", "voice2", "voice3", "soundEffect1", "soundEffect2", "soundEffect3"]
     }
     
-}
-
-extension EqualizerManager {
-    // MARK: - Helper Methods
-    
-    func reconnectNodesWithFormat(_ format: AVAudioFormat) {
-        print("🔧 EqualizerManager: Reconnecting audio nodes with format: \(format.description)")
-        
-        // Disconnect existing connections
-        audioEngine.disconnectNodeInput(equalizer)
-        audioEngine.disconnectNodeInput(audioEngine.mainMixerNode)
-        
-        // Reconnect with new format
-        audioEngine.connect(playerNode, to: equalizer, format: format)
-        audioEngine.connect(equalizer, to: audioEngine.mainMixerNode, format: format)
-        
-        print("🔧 EqualizerManager: Nodes reconnected with new format")
-    }
 }
