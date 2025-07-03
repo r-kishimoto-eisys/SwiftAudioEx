@@ -7,7 +7,6 @@
 
 import Foundation
 import AVFoundation
-import Accelerate
 
 // RNTP_EQUALIZER: イコライザープリセット定義
 public enum EqualizerPreset: String, CaseIterable {
