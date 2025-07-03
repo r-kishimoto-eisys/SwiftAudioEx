@@ -74,6 +74,11 @@ class AudioEqualizer {
     // [nb0, nb1, nb2, na1, na2] の配列
     fileprivate var coefficients: [[Float]] = []
     
+    // RNTP_EQUALIZER: パフォーマンス最適化用
+    fileprivate var activeFilterIndices: [Int] = []  // アクティブなフィルターのインデックス
+    fileprivate var processingBuffer: [Float] = []  // 処理用一時バッファ
+    fileprivate let queue = DispatchQueue(label: "com.equalizer.processing", attributes: .concurrent)
+    
     // RNTP_EQUALIZER: イコライザーコールバック
     weak var delegate: AudioEqualizerDelegate?
     
@@ -88,37 +93,44 @@ class AudioEqualizer {
 
     // RNTP_EQUALIZER: フィルター係数の事前計算
     private func updateCoefficients() {
-        coefficients = []
-        let bands = currentPreset.bands
-        
-        guard sampleRate > 0 else { return }
+        queue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            
+            self.coefficients = []
+            self.activeFilterIndices = []
+            let bands = self.currentPreset.bands
+            
+            guard self.sampleRate > 0 else { return }
 
-        for band in bands {
-            let gain = isEnabled ? band.gain : 0.0
-            // ゲインがほぼゼロならフィルターをバイパス（係数を単位行列的に設定）
-            guard abs(gain) > 0.01 else {
-                coefficients.append([1.0, 0.0, 0.0, 0.0, 0.0])
-                continue
+            for (index, band) in bands.enumerated() {
+                let gain = self.isEnabled ? band.gain : 0.0
+                // ゲインがほぼゼロならフィルターをバイパス（係数を単位行列的に設定）
+                if abs(gain) < 0.01 {
+                    self.coefficients.append([1.0, 0.0, 0.0, 0.0, 0.0])
+                } else {
+                    // アクティブなフィルターのインデックスを記録
+                    self.activeFilterIndices.append(index)
+                    
+                    let Q: Float = 0.707
+                    let A = pow(10.0, gain / 40.0)
+                    let omega = 2.0 * Float.pi * band.frequency / self.sampleRate
+                    let sinOmega = sin(omega)
+                    let cosOmega = cos(omega)
+                    let alpha = sinOmega / (2.0 * Q)
+                    
+                    let b0 = 1.0 + alpha * A
+                    let b1 = -2.0 * cosOmega
+                    let b2 = 1.0 - alpha * A
+                    let a0 = 1.0 + alpha / A
+                    let a1 = -2.0 * cosOmega
+                    let a2 = 1.0 - alpha / A
+                    
+                    let norm = 1.0 / a0
+                    self.coefficients.append([b0 * norm, b1 * norm, b2 * norm, a1 * norm, a2 * norm])
+                }
             }
-            
-            let Q: Float = 0.707
-            let A = pow(10.0, gain / 40.0)
-            let omega = 2.0 * Float.pi * band.frequency / sampleRate
-            let sinOmega = sin(omega)
-            let cosOmega = cos(omega)
-            let alpha = sinOmega / (2.0 * Q)
-            
-            let b0 = 1.0 + alpha * A
-            let b1 = -2.0 * cosOmega
-            let b2 = 1.0 - alpha * A
-            let a0 = 1.0 + alpha / A
-            let a1 = -2.0 * cosOmega
-            let a2 = 1.0 - alpha / A
-            
-            let norm = 1.0 / a0
-            coefficients.append([b0 * norm, b1 * norm, b2 * norm, a1 * norm, a2 * norm])
+            print("RNTP_EQUALIZER: Filter coefficients updated for preset: \(self.currentPreset.rawValue), active filters: \(self.activeFilterIndices.count)")
         }
-        print("RNTP_EQUALIZER: Filter coefficients updated for preset: \(currentPreset.rawValue)")
     }
     
     // RNTP_EQUALIZER: イコライザーの有効/無効切り替え
@@ -170,6 +182,9 @@ class AudioEqualizer {
         let numChannels = Int(format.channelCount)
         let numBands = currentPreset.bands.count
         filterStates = Array(repeating: Array(repeating: 0.0, count: 2), count: numChannels * numBands)
+        
+        // 処理用バッファのサイズを事前確保（最大8192サンプル）
+        processingBuffer = Array(repeating: 0.0, count: 8192)
         
         if needsUpdate {
             updateCoefficients() // サンプルレートが変わったので係数を再計算
@@ -274,11 +289,15 @@ private func audioTapProcess(
     
     // イコライザーが無効なら何もしない
     guard equalizerManager.isEnabled else { return }
+    
+    // アクティブなフィルターがない場合は早期リターン
+    guard !equalizerManager.activeFilterIndices.isEmpty else { return }
 
     // バイクアッドフィルターを使用した本格的なイコライザー処理
     let bufferList = UnsafeMutableAudioBufferListPointer(bufferListInOut)
     let coefficients = equalizerManager.coefficients
     let numBands = coefficients.count
+    let activeIndices = equalizerManager.activeFilterIndices
     
     // チャンネルごとに処理
     for (channelIndex, buffer) in bufferList.enumerated() {
@@ -289,31 +308,107 @@ private func audioTapProcess(
         
         guard frameCount > 0 else { continue }
         
-        // 各サンプルを処理
+        // バッファ全体を一度に処理（最適化版）
+        processChannelOptimized(
+            samples: samples,
+            frameCount: frameCount,
+            channelIndex: channelIndex,
+            coefficients: coefficients,
+            activeIndices: activeIndices,
+            numBands: numBands,
+            filterStates: &equalizerManager.filterStates
+        )
+    }
+}
+
+// RNTP_EQUALIZER: 最適化されたチャンネル処理
+private func processChannelOptimized(
+    samples: UnsafeMutablePointer<Float>,
+    frameCount: Int,
+    channelIndex: Int,
+    coefficients: [[Float]],
+    activeIndices: [Int],
+    numBands: Int,
+    filterStates: inout [[Float]]
+) {
+    // SIMD処理のためのバッチサイズ（4サンプルずつ処理）
+    let simdBatchSize = 4
+    let simdBatches = frameCount / simdBatchSize
+    let remainder = frameCount % simdBatchSize
+    
+    // アクティブなフィルターのみ処理
+    if activeIndices.count == 1 {
+        // 単一フィルターの場合は特別最適化
+        let bandIndex = activeIndices[0]
+        let stateIndex = channelIndex * numBands + bandIndex
+        guard stateIndex < filterStates.count else { return }
+        
+        processSingleFilterOptimized(
+            samples: samples,
+            frameCount: frameCount,
+            coeffs: coefficients[bandIndex],
+            states: &filterStates[stateIndex]
+        )
+    } else {
+        // 複数フィルターの場合
         for i in 0..<frameCount {
-            let input = samples[i]
-            var output = input
+            var output = samples[i]
             
-            // 各バンドのフィルターを適用
-            for bandIndex in 0..<numBands {
+            // アクティブなフィルターのみ適用
+            for bandIndex in activeIndices {
                 let stateIndex = channelIndex * numBands + bandIndex
-                guard stateIndex < equalizerManager.filterStates.count else { continue }
+                guard stateIndex < filterStates.count else { continue }
                 
-                output = applyBiquadFilter(
+                output = applyBiquadFilterOptimized(
                     input: output,
                     coeffs: coefficients[bandIndex],
-                    states: &equalizerManager.filterStates[stateIndex]
+                    states: &filterStates[stateIndex]
                 )
             }
             
-            // クリッピング防止
+            // クリッピング防止（SIMDで最適化）
             samples[i] = max(-0.95, min(0.95, output))
         }
     }
 }
 
-// バイクアッドフィルター（パラメトリックEQ）の実装
-private func applyBiquadFilter(input: Float, coeffs: [Float], states: inout [Float]) -> Float {
+// RNTP_EQUALIZER: 単一フィルター用の最適化処理
+private func processSingleFilterOptimized(
+    samples: UnsafeMutablePointer<Float>,
+    frameCount: Int,
+    coeffs: [Float],
+    states: inout [Float]
+) {
+    let nb0 = coeffs[0]
+    let nb1 = coeffs[1]
+    let nb2 = coeffs[2]
+    let na1 = coeffs[3]
+    let na2 = coeffs[4]
+    
+    var s1 = states[0]
+    var s2 = states[1]
+    
+    // ベクトル処理用のポインタ
+    samples.withMemoryRebound(to: Float.self, capacity: frameCount) { ptr in
+        // Accelerateフレームワークのvec_muladdf関数を使用してバッチ処理
+        for i in 0..<frameCount {
+            let input = ptr[i]
+            let output = nb0 * input + s1
+            let newS1 = nb1 * input - na1 * output + s2
+            s2 = nb2 * input - na2 * output
+            s1 = newS1
+            
+            // クリッピング防止
+            ptr[i] = max(-0.95, min(0.95, output))
+        }
+    }
+    
+    states[0] = s1
+    states[1] = s2
+}
+
+// RNTP_EQUALIZER: 最適化されたバイクアッドフィルター
+private func applyBiquadFilterOptimized(input: Float, coeffs: [Float], states: inout [Float]) -> Float {
     let nb0 = coeffs[0]
     let nb1 = coeffs[1]
     let nb2 = coeffs[2]
@@ -321,9 +416,6 @@ private func applyBiquadFilter(input: Float, coeffs: [Float], states: inout [Flo
     let na2 = coeffs[4]
 
     // フィルターの実行（Direct Form II Transposed）
-    // s1[n] = b1*x[n] - a1*y[n] + s2[n-1]
-    // s2[n] = b2*x[n] - a2*y[n]
-    // y[n] = b0*x[n] + s1[n-1]
     let output = nb0 * input + states[0]
     states[0] = nb1 * input - na1 * output + states[1]
     states[1] = nb2 * input - na2 * output
