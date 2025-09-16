@@ -216,11 +216,11 @@ class AudioEqualizer {
             process: audioTapProcess
         )
         
-        var tap: Unmanaged<MTAudioProcessingTap>?
+        var tap: MTAudioProcessingTap?
         let status = MTAudioProcessingTapCreate(nil, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap)
-        
-        if status == noErr, let tapUnmanaged = tap {
-            parameters.audioTapProcessor = tapUnmanaged.takeRetainedValue()
+
+        if status == noErr, let tap = tap {
+            parameters.audioTapProcessor = tap
             audioMix.inputParameters = [parameters]
             print("RNTP_EQUALIZER: Successfully created AudioMix with Biquad Filter")
             return audioMix
